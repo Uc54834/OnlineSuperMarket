@@ -24,6 +24,13 @@
 #  • VM_USER in docker group:   sudo usermod -aG docker $VM_USER
 #  • ACR Admin enabled:
 #      Azure Portal → Container Registry → Settings → Access keys → Admin ON
+#
+#  ─── AGENT OPTIONS (pick one) ────────────────────────────────────────────────
+#  Option A — Self-hosted (free, instant):
+#    Install agent on VM, set pool below to: name: Default
+#  Option B — Microsoft-hosted (needs parallel job grant):
+#    Request free grant: https://aka.ms/azpipelines-parallelism-request
+#    Set pool below to: vmImage: ubuntu-latest
 # =============================================================================
 
 trigger:
