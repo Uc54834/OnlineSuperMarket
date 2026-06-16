@@ -3,7 +3,7 @@
 #
 #  Stages:
 #    CI  → build backend + frontend images in parallel → push to ACR
-#    CD  → runs ON the Azure VM (self-hosted agent) → pull from ACR → restart
+#    CD  → Microsoft-hosted agent SSHs into VM → pull from ACR → restart
 #
 #  ─── SETUP: Pipelines → Library → Variable Group ─────────────────────────────
 #  Group name : onlinesupermarket-secrets
@@ -13,25 +13,17 @@
 #  ACR_LOGIN_SERVER  myregistry.azurecr.io              no
 #  ACR_USERNAME      myregistry                         no
 #  ACR_PASSWORD      <ACR → Access keys → password>     YES ✓
+#  VM_HOST           20.1.2.3                           no
+#  VM_USER           azureuser                          no
+#  VM_SSH_KEY_B64    base64 -w 0 key.pem                YES ✓
 #  PORT              5000                               no
 #  MONGODB_URI       mongodb://mongo:27017/SuperMarket  YES ✓
 #
-#  ─── SELF-HOSTED AGENT SETUP (one-time on your Azure VM) ────────────────────
-#  mkdir ~/azagent && cd ~/azagent
-#  curl -O https://vstsagentpackage.azureedge.net/agent/3.236.1/vsts-agent-linux-x64-3.236.1.tar.gz
-#  tar zxvf vsts-agent-linux-x64-3.236.1.tar.gz
-#  ./config.sh
-#    Server URL : https://dev.azure.com/<your-org>
-#    Auth type  : PAT
-#    PAT        : User Settings → Personal Access Tokens → Agent Pools: Read & Manage
-#    Pool name  : Default
-#  sudo ./svc.sh install && sudo ./svc.sh start
-#  sudo usermod -aG docker $USER
-#
 #  ─── VM PRE-REQUISITES ───────────────────────────────────────────────────────
-#  • Docker Engine installed
-#  • ACR Admin enabled:
-#      Azure Portal → Container Registry → Settings → Access keys → Admin ON
+#  • Docker + docker compose installed
+#  • VM_USER in docker group: sudo usermod -aG docker $VM_USER
+#  • Port 22 open in Azure NSG (inbound rule)
+#  • ACR Admin enabled: Portal → Container Registry → Access keys → Admin ON
 # =============================================================================
 
 trigger:
@@ -141,11 +133,11 @@ stages:
       condition: always()
 
 # =============================================================================
-#  STAGE 2 — CD : Deploy directly on the Azure VM
-#  Self-hosted agent runs ON the VM — pulls images from ACR, no SSH needed
+#  STAGE 2 — CD : SSH into VM and deploy
+#  Requires port 22 open in Azure NSG for Microsoft-hosted agent IPs
 # =============================================================================
 - stage: CD
-  displayName: "CD — Deploy on VM"
+  displayName: "CD — Deploy to VM"
   dependsOn: CI
   condition: >
     and(
@@ -159,110 +151,128 @@ stages:
   jobs:
 
   - job: Deploy
-    displayName: "Pull from ACR & restart stack"
+    displayName: "SSH deploy"
     pool:
-      name: Default        # self-hosted agent running ON the Azure VM
+      vmImage: "ubuntu-latest"
 
     steps:
 
-    # ── Checkout (to get docker-compose.yml) ───────────────────────────────
-    - checkout: self
-      displayName: "Checkout"
-
-    # ── Login to ACR ───────────────────────────────────────────────────────
+    # ── Install SSH key ─────────────────────────────────────────────────────
     - bash: |
-        echo "$(ACR_PASSWORD)" | docker login "$(ACR_LOGIN_SERVER)" \
-          --username "$(ACR_USERNAME)" --password-stdin
-      displayName: "ACR Login"
+        mkdir -p ~/.ssh && chmod 700 ~/.ssh
+        echo "$(VM_SSH_KEY_B64)" | base64 -d > ~/.ssh/deploy_key
+        chmod 600 ~/.ssh/deploy_key
+        ssh-keyscan -H "$(VM_HOST)" >> ~/.ssh/known_hosts 2>/dev/null
+        echo "SSH key ready."
+      displayName: "Install SSH key"
       env:
-        ACR_PASSWORD: $(ACR_PASSWORD)
+        VM_SSH_KEY_B64: $(VM_SSH_KEY_B64)
 
-    # ── Pull new images from ACR ────────────────────────────────────────────
+    # ── Copy docker-compose.yml to VM ───────────────────────────────────────
     - bash: |
+        scp -i ~/.ssh/deploy_key \
+          -o StrictHostKeyChecking=no \
+          -o BatchMode=yes \
+          docker-compose.yml \
+          "$(VM_USER)@$(VM_HOST):~/docker-compose.yml"
+        echo "Copied docker-compose.yml to VM."
+      displayName: "Copy compose file"
+      env:
+        VM_USER: $(VM_USER)
+        VM_HOST: $(VM_HOST)
+
+    # ── Deploy on VM ────────────────────────────────────────────────────────
+    - bash: |
+        ssh -i ~/.ssh/deploy_key \
+          -o StrictHostKeyChecking=no \
+          -o BatchMode=yes \
+          "$(VM_USER)@$(VM_HOST)" \
+          "ACR_LOGIN_SERVER='$(ACR_LOGIN_SERVER)' \
+           ACR_USERNAME='$(ACR_USERNAME)' \
+           ACR_PASSWORD='$(ACR_PASSWORD)' \
+           API_IMAGE='$(API_IMAGE)' \
+           FRONTEND_IMAGE='$(FRONTEND_IMAGE)' \
+           IMAGE_TAG='$(SHORT_SHA)' \
+           COMPOSE_PROJECT='$(COMPOSE_PROJECT)' \
+           PORT='$(PORT)' \
+           MONGODB_URI='$(MONGODB_URI)' \
+           bash -s" << 'ENDSSH'
         set -euo pipefail
-        docker pull "$(ACR_LOGIN_SERVER)/$(API_IMAGE):$(SHORT_SHA)"
-        docker pull "$(ACR_LOGIN_SERVER)/$(FRONTEND_IMAGE):$(SHORT_SHA)"
-        echo "Images pulled."
-      displayName: "Pull images from ACR"
 
-    # ── Write .env (no heredoc indentation issues — use printf) ────────────
-    - bash: |
-        printf 'PORT=%s\nMONGODB_URI=%s\n' "$(PORT)" "$(MONGODB_URI)" > ~/supermarket.env
+        echo "=== [1/5] ACR login ==="
+        echo "$ACR_PASSWORD" | docker login "$ACR_LOGIN_SERVER" \
+          --username "$ACR_USERNAME" --password-stdin
+
+        echo "=== [2/5] Writing .env ==="
+        printf 'PORT=%s\nMONGODB_URI=%s\n' "$PORT" "$MONGODB_URI" > ~/supermarket.env
         chmod 600 ~/supermarket.env
-        echo ".env written."
-      displayName: "Write .env"
-      env:
-        PORT:        $(PORT)
-        MONGODB_URI: $(MONGODB_URI)
 
-    # ── Write compose override (ACR images, no local build) ────────────────
-    - bash: |
-        printf 'services:\n  api:\n    image: %s\n    build: !reset null\n  frontend:\n    image: %s\n    build: !reset null\n' \
-          "$(ACR_LOGIN_SERVER)/$(API_IMAGE):$(SHORT_SHA)" \
-          "$(ACR_LOGIN_SERVER)/$(FRONTEND_IMAGE):$(SHORT_SHA)" \
-          > ~/docker-compose.override.yml
-        echo "Compose override written."
-      displayName: "Write compose override"
+        echo "=== [3/5] Pulling images ==="
+        docker pull "$ACR_LOGIN_SERVER/$API_IMAGE:$IMAGE_TAG"
+        docker pull "$ACR_LOGIN_SERVER/$FRONTEND_IMAGE:$IMAGE_TAG"
 
-    # ── Copy compose file from repo ────────────────────────────────────────
-    - bash: |
-        cp "$(Build.SourcesDirectory)/docker-compose.yml" ~/docker-compose.yml
-        echo "docker-compose.yml copied."
-      displayName: "Copy docker-compose.yml"
+        echo "=== [4/5] Writing compose override ==="
+        cat > ~/docker-compose.override.yml << EOF
+        services:
+          api:
+            image: $ACR_LOGIN_SERVER/$API_IMAGE:$IMAGE_TAG
+            build: !reset null
+          frontend:
+            image: $ACR_LOGIN_SERVER/$FRONTEND_IMAGE:$IMAGE_TAG
+            build: !reset null
+        EOF
 
-    # ── Restart stack ──────────────────────────────────────────────────────
-    - bash: |
-        set -euo pipefail
+        echo "=== [5/5] Restarting stack ==="
         docker compose \
           -f ~/docker-compose.yml \
           -f ~/docker-compose.override.yml \
-          -p "$(COMPOSE_PROJECT)" \
+          -p "$COMPOSE_PROJECT" \
           --env-file ~/supermarket.env \
           down --remove-orphans || true
 
         docker compose \
           -f ~/docker-compose.yml \
           -f ~/docker-compose.override.yml \
-          -p "$(COMPOSE_PROJECT)" \
+          -p "$COMPOSE_PROJECT" \
           --env-file ~/supermarket.env \
           up -d --no-build
 
-        echo "Stack restarted."
-      displayName: "Restart stack"
+        docker logout "$ACR_LOGIN_SERVER"
 
-    # ── ACR Logout ─────────────────────────────────────────────────────────
-    - bash: docker logout "$(ACR_LOGIN_SERVER)"
-      displayName: "ACR Logout"
-      condition: always()
-
-    # ── Health check ───────────────────────────────────────────────────────
-    - bash: |
-        set -euo pipefail
         echo "Waiting for services..."
         for i in $(seq 1 12); do
-          API_HTTP=$(curl -sf -o /dev/null -w "%{http_code}" \
-            "http://localhost:3000/api/health" 2>/dev/null || echo "000")
-          if [ "$API_HTTP" = "200" ]; then
-            echo "  API ready after attempt $i"
-            break
-          fi
-          echo "  attempt $i/12 — HTTP $API_HTTP, retrying in 5s..."
+          HTTP=$(curl -sf -o /dev/null -w "%{http_code}" \
+            http://localhost:3000/api/health 2>/dev/null || echo "000")
+          [ "$HTTP" = "200" ] && { echo "Ready after attempt $i"; break; }
+          echo "  attempt $i/12 — HTTP $HTTP, retrying in 5s..."
           sleep 5
         done
 
-        WEB_HTTP=$(curl -sf -o /dev/null -w "%{http_code}" \
-          "http://localhost:3000" 2>/dev/null || echo "000")
-
-        echo ""
-        echo "  API  /api/health  →  HTTP $API_HTTP"
-        echo "  Web  /            →  HTTP $WEB_HTTP"
-        echo ""
-
-        if [ "$API_HTTP" != "200" ]; then
-          echo "ERROR: API health check failed — logs:"
+        HTTP=$(curl -sf -o /dev/null -w "%{http_code}" \
+          http://localhost:3000/api/health 2>/dev/null || echo "000")
+        if [ "$HTTP" != "200" ]; then
+          echo "ERROR: health check failed"
           docker logs supermarket_api --tail 80 2>&1 || true
           exit 1
         fi
 
-        echo "Deploy complete!  tag=$(SHORT_SHA)"
-      displayName: "Health check"
+        echo "Deploy complete! tag=$IMAGE_TAG"
+        ENDSSH
+      displayName: "Deploy on VM"
+      env:
+        ACR_LOGIN_SERVER: $(ACR_LOGIN_SERVER)
+        ACR_USERNAME:     $(ACR_USERNAME)
+        ACR_PASSWORD:     $(ACR_PASSWORD)
+        VM_USER:          $(VM_USER)
+        VM_HOST:          $(VM_HOST)
+        API_IMAGE:        $(API_IMAGE)
+        FRONTEND_IMAGE:   $(FRONTEND_IMAGE)
+        SHORT_SHA:        $(SHORT_SHA)
+        COMPOSE_PROJECT:  $(COMPOSE_PROJECT)
+        PORT:             $(PORT)
+        MONGODB_URI:      $(MONGODB_URI)
+
+    # ── Cleanup ────────────────────────────────────────────────────────────
+    - bash: rm -f ~/.ssh/deploy_key
+      displayName: "Cleanup"
+      condition: always()
