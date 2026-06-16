@@ -251,18 +251,18 @@ stages:
                 ps
 
               API_HTTP=$(curl -sf -o /dev/null -w "%{http_code}" \
-                "http://localhost:$PORT/health" 2>/dev/null || echo "000")
+                "http://localhost:3000/api/health" 2>/dev/null || echo "000")
               WEB_HTTP=$(curl -sf -o /dev/null -w "%{http_code}" \
-                "http://localhost:80" 2>/dev/null || echo "000")
+                "http://localhost:3000" 2>/dev/null || echo "000")
 
               echo ""
-              echo "  API  /health  →  HTTP $API_HTTP"
-              echo "  Web  /        →  HTTP $WEB_HTTP"
+              echo "  API  /api/health  →  HTTP $API_HTTP"
+              echo "  Web  /            →  HTTP $WEB_HTTP"
               echo ""
 
               if [ "$API_HTTP" != "200" ]; then
                 echo "ERROR: API health check failed — last 80 log lines:"
-                docker logs "${COMPOSE_PROJECT}-api-1" --tail 80 2>&1 || true
+                docker logs supermarket_api --tail 80 2>&1 || true
                 exit 1
               fi
 
