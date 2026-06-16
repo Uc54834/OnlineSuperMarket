@@ -18,8 +18,6 @@
 #  VM_SSH_KEY_B64      base64 -w 0 key.pem  (single-line)   YES ✓
 #  PORT                5000                                  no
 #  MONGODB_URI         mongodb://mongo:27017/SuperMarket     YES ✓
-#  ALLOWED_ORIGINS     http://yourdomain.com                 no
-#  REACT_APP_API_URL   http://yourdomain.com:5000            no
 #
 #  ─── VM PRE-REQUISITES ───────────────────────────────────────────────────────
 #  • Docker Engine installed
@@ -114,7 +112,6 @@ stages:
 
         docker build \
           --file  frontend/Dockerfile \
-          --build-arg REACT_APP_API_URL="$(REACT_APP_API_URL)" \
           --tag   "${IMAGE}:${TAG}" \
           --tag   "${IMAGE}:latest" \
           --cache-from "${IMAGE}:latest" \
@@ -206,8 +203,6 @@ stages:
               cat > ~/supermarket.env << ENV
               PORT=$PORT
               MONGODB_URI=$MONGODB_URI
-              ALLOWED_ORIGINS=$ALLOWED_ORIGINS
-              REACT_APP_API_URL=$REACT_APP_API_URL
               ENV
               chmod 600 ~/supermarket.env
 
@@ -306,8 +301,6 @@ stages:
                    COMPOSE_PROJECT='$(COMPOSE_PROJECT)' \
                    PORT='$(PORT)' \
                    MONGODB_URI='$(MONGODB_URI)' \
-                   ALLOWED_ORIGINS='$(ALLOWED_ORIGINS)' \
-                   REACT_APP_API_URL='$(REACT_APP_API_URL)' \
                    ~/deploy.sh"
             displayName: "Run deploy on VM"
             env:
@@ -323,8 +316,6 @@ stages:
               COMPOSE_PROJECT:   $(COMPOSE_PROJECT)
               PORT:              $(PORT)
               MONGODB_URI:       $(MONGODB_URI)
-              ALLOWED_ORIGINS:   $(ALLOWED_ORIGINS)
-              REACT_APP_API_URL: $(REACT_APP_API_URL)
 
           # ── Cleanup SSH key from agent (always runs) ──────────────────────────
           - bash: |

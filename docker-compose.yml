@@ -30,9 +30,6 @@
     environment:
       PORT: "${PORT}"
       MONGODB_URI: "${MONGODB_URI}"
-      ALLOWED_ORIGINS: "${ALLOWED_ORIGINS}"
-    ports:
-      - "${PORT}:${PORT}"
     depends_on:
       mongo:
         condition: service_healthy

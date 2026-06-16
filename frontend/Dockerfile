@@ -9,10 +9,6 @@ RUN npm install --legacy-peer-deps
 # Copy source
 COPY . .
 
-# Build-time env var — URL the BROWSER uses to reach the API
-ARG REACT_APP_API_URL=http://localhost:5000
-ENV REACT_APP_API_URL=$REACT_APP_API_URL
-
 # Create optimised production bundle
 RUN npm run build
 
