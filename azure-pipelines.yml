@@ -15,7 +15,7 @@
 #  ACR_PASSWORD        <ACR → Access keys → password>       YES ✓
 #  VM_HOST             20.1.2.3                             no
 #  VM_USER             azureuser                            no
-#  VM_SSH_KEY          -----BEGIN OPENSSH PRIVATE KEY-----  YES ✓
+#  VM_SSH_KEY_B64      base64 -w 0 key.pem  (single-line)   YES ✓
 #  PORT                5000                                  no
 #  MONGODB_URI         mongodb://mongo:27017/SuperMarket     YES ✓
 #  ALLOWED_ORIGINS     http://yourdomain.com                 no
@@ -179,7 +179,7 @@ stages:
           - bash: |
               mkdir -p ~/.ssh
               chmod 700 ~/.ssh
-              printf '%s\n' "$(VM_SSH_KEY)" > ~/.ssh/deploy_key
+              echo "$(VM_SSH_KEY_B64)" | base64 -d > ~/.ssh/deploy_key
               chmod 600 ~/.ssh/deploy_key
               ssh-keyscan -H "$(VM_HOST)" >> ~/.ssh/known_hosts 2>/dev/null
               echo "SSH key ready."
