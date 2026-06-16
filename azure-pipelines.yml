@@ -1,0 +1,331 @@
+﻿# =============================================================================
+#  OnlineSuperMarket â€” Azure DevOps CI/CD Pipeline
+#  No service connection required. Uses ACR admin credentials from Library.
+#
+#  SETUP â€” Pipelines â†’ Library â†’ + Variable group
+#  Group name: onlinesupermarket-secrets
+#
+#  Variable              Example value                        Secret
+#  â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€    â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€    â”€â”€â”€â”€â”€â”€
+#  ACR_LOGIN_SERVER      myregistry.azurecr.io                no
+#  ACR_USERNAME          myregistry                           no
+#  ACR_PASSWORD          <password from ACR Access keys>      YES
+#  VM_SSH_HOST           20.1.2.3                             no
+#  VM_SSH_USER           azureuser                            no
+#  VM_SSH_PRIVATE_KEY    -----BEGIN RSA PRIVATE KEY-----...   YES
+#  PORT                  5000                                 no
+#  MONGODB_URI           mongodb://mongo:27017/SuperMarket     YES
+#  ALLOWED_ORIGINS       http://yourdomain.com                no
+#  REACT_APP_API_URL     http://yourdomain.com:5000            no
+#
+#  Enable ACR admin credentials:
+#  Azure Portal > Container Registry > Settings > Access keys > Admin user ON
+# =============================================================================
+
+trigger:
+  branches:
+    include:
+      - main
+      - dev
+  paths:
+    exclude:
+      - "*.md"
+      - ".gitignore"
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  - group: onlinesupermarket-secrets
+  - name: BACKEND_IMAGE
+    value: "onlinesupermarket-api"
+  - name: FRONTEND_IMAGE
+    value: "onlinesupermarket-frontend"
+  - name: COMPOSE_PROJECT
+    value: "onlinesupermarket"
+
+# =============================================================================
+#  STAGE 1 â€” BUILD AND PUSH TO ACR
+# =============================================================================
+stages:
+
+- stage: Build
+  displayName: "Build and Push to ACR"
+  jobs:
+
+  - job: BuildPush
+    displayName: "Docker build and push"
+    pool:
+      vmImage: "ubuntu-latest"
+
+    steps:
+
+    # Checkout full repo including docker-compose.prod.yml
+    - checkout: self
+      displayName: "Checkout source"
+      fetchDepth: 0
+
+    # Show working directory structure for debugging
+    - bash: |
+        echo "Working directory: $(pwd)"
+        echo "Repo root contents:"
+        ls -la
+        echo ""
+        echo "Looking for Dockerfiles:"
+        find . -name "Dockerfile" 2>/dev/null
+      displayName: "Debug â€” show repo structure"
+
+    # Compute 8-char git SHA for image tagging
+    - bash: |
+        SHORT=$(echo "$BUILD_SOURCEVERSION" | cut -c1-8)
+        echo "Short SHA: $SHORT"
+        echo "##vso[task.setvariable variable=SHORT_SHA;isOutput=true]$SHORT"
+      displayName: "Compute short SHA tag"
+      name: tagStep
+      env:
+        BUILD_SOURCEVERSION: $(Build.SourceVersion)
+
+    # Login to ACR using admin credentials from variable group
+    - bash: |
+        echo "$ACR_PASSWORD" | docker login "$ACR_LOGIN_SERVER" \
+          --username "$ACR_USERNAME" \
+          --password-stdin
+        echo "ACR login OK: $ACR_LOGIN_SERVER"
+      displayName: "ACR Login"
+      env:
+        ACR_LOGIN_SERVER: $(ACR_LOGIN_SERVER)
+        ACR_USERNAME:     $(ACR_USERNAME)
+        ACR_PASSWORD:     $(ACR_PASSWORD)
+
+    # Build and push backend image
+    - bash: |
+        set -euo pipefail
+
+        # Locate backend Dockerfile regardless of where pipeline.yml lives
+        if [ -f "backend/Dockerfile" ]; then
+          DOCKERFILE="backend/Dockerfile"
+          CONTEXT="backend/"
+        elif [ -f "Dockerfile" ]; then
+          DOCKERFILE="Dockerfile"
+          CONTEXT="."
+        else
+          echo "ERROR: Cannot find backend Dockerfile"
+          find . -name "Dockerfile" 2>/dev/null
+          exit 1
+        fi
+
+        FULL="${ACR_LOGIN_SERVER}/${BACKEND_IMAGE}"
+        echo "Dockerfile : $DOCKERFILE"
+        echo "Context    : $CONTEXT"
+        echo "Image      : ${FULL}:${SHORT_SHA}"
+
+        docker build \
+          --file "$DOCKERFILE" \
+          --tag "${FULL}:${SHORT_SHA}" \
+          --tag "${FULL}:latest" \
+          "$CONTEXT"
+
+        docker push "${FULL}:${SHORT_SHA}"
+        docker push "${FULL}:latest"
+        echo "Pushed ${FULL}:${SHORT_SHA}"
+      displayName: "Build and Push Backend"
+      env:
+        ACR_LOGIN_SERVER: $(ACR_LOGIN_SERVER)
+        BACKEND_IMAGE:    $(BACKEND_IMAGE)
+        SHORT_SHA:        $(tagStep.SHORT_SHA)
+
+    # Build and push frontend â€” REACT_APP_API_URL baked into the bundle
+    - bash: |
+        set -euo pipefail
+
+        # Locate frontend Dockerfile
+        if [ -f "frontend/Dockerfile" ]; then
+          DOCKERFILE="frontend/Dockerfile"
+          CONTEXT="frontend/"
+        else
+          echo "ERROR: Cannot find frontend Dockerfile"
+          find . -name "Dockerfile" 2>/dev/null
+          exit 1
+        fi
+
+        FULL="${ACR_LOGIN_SERVER}/${FRONTEND_IMAGE}"
+        echo "Dockerfile : $DOCKERFILE"
+        echo "Context    : $CONTEXT"
+        echo "Image      : ${FULL}:${SHORT_SHA}"
+
+        docker build \
+          --file "$DOCKERFILE" \
+          --tag "${FULL}:${SHORT_SHA}" \
+          --tag "${FULL}:latest" \
+          --build-arg REACT_APP_API_URL="${REACT_APP_API_URL}" \
+          "$CONTEXT"
+
+        docker push "${FULL}:${SHORT_SHA}"
+        docker push "${FULL}:latest"
+        echo "Pushed ${FULL}:${SHORT_SHA}"
+      displayName: "Build and Push Frontend"
+      env:
+        ACR_LOGIN_SERVER:  $(ACR_LOGIN_SERVER)
+        FRONTEND_IMAGE:    $(FRONTEND_IMAGE)
+        SHORT_SHA:         $(tagStep.SHORT_SHA)
+        REACT_APP_API_URL: $(REACT_APP_API_URL)
+
+    # Always logout from ACR
+    - bash: |
+        docker logout "$ACR_LOGIN_SERVER"
+        echo "Logged out from ACR."
+      displayName: "ACR Logout"
+      condition: always()
+      env:
+        ACR_LOGIN_SERVER: $(ACR_LOGIN_SERVER)
+
+    # Publish docker-compose.prod.yml (already in repo) as pipeline artifact
+    - task: PublishBuildArtifacts@1
+      displayName: "Publish compose artifact"
+      inputs:
+        PathtoPublish: "$(Build.SourcesDirectory)/backend/docker-compose.prod.yml"
+        ArtifactName: "compose"
+
+# =============================================================================
+#  STAGE 2 â€” DEPLOY TO AZURE VM
+# =============================================================================
+- stage: Deploy
+  displayName: "Deploy to Azure VM"
+  dependsOn: Build
+  condition: and(succeeded(), eq(variables['Build.SourceBranchName'], 'main'))
+
+  variables:
+    SHORT_SHA: $[ stageDependencies.Build.BuildPush.outputs['tagStep.SHORT_SHA'] ]
+
+  jobs:
+
+  - deployment: VMDeploy
+    displayName: "SSH deploy to VM"
+    pool:
+      vmImage: "ubuntu-latest"
+    environment: "production"
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          # Download the compose artifact published in Build stage
+          - download: current
+            artifact: compose
+            displayName: "Download compose artifact"
+
+          # Write SSH private key to agent
+          - bash: |
+              mkdir -p ~/.ssh
+              echo "$VM_SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+              chmod 600 ~/.ssh/deploy_key
+              ssh-keyscan -H "$VM_SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+              echo "SSH key ready."
+            displayName: "Setup SSH key"
+            env:
+              VM_SSH_PRIVATE_KEY: $(VM_SSH_PRIVATE_KEY)
+              VM_SSH_HOST:        $(VM_SSH_HOST)
+
+          # Copy compose file to VM home directory
+          - bash: |
+              scp \
+                -i ~/.ssh/deploy_key \
+                -o StrictHostKeyChecking=no \
+                -o BatchMode=yes \
+                "${PIPELINE_WORKSPACE}/compose/docker-compose.prod.yml" \
+                "${VM_SSH_USER}@${VM_SSH_HOST}:~/docker-compose.prod.yml"
+              echo "Compose file copied to VM."
+            displayName: "Copy compose file to VM"
+            env:
+              VM_SSH_HOST:        $(VM_SSH_HOST)
+              VM_SSH_USER:        $(VM_SSH_USER)
+              PIPELINE_WORKSPACE: $(Pipeline.Workspace)
+
+          # SSH into VM â€” write .env, pull images, restart stack
+          - bash: |
+              ssh \
+                -i ~/.ssh/deploy_key \
+                -o StrictHostKeyChecking=no \
+                -o BatchMode=yes \
+                "${VM_SSH_USER}@${VM_SSH_HOST}" "bash -s" << ENDSSH
+              set -euo pipefail
+
+              echo "=== [1/5] ACR Login ==="
+              echo "${ACR_PASSWORD}" | docker login "${ACR_LOGIN_SERVER}" \
+                --username "${ACR_USERNAME}" \
+                --password-stdin
+
+              echo "=== [2/5] Write env file ==="
+              cat > ~/env.prod << ENVEOF
+              ACR_LOGIN_SERVER=${ACR_LOGIN_SERVER}
+              IMAGE_TAG=${SHORT_SHA}
+              PORT=${PORT}
+              MONGODB_URI=${MONGODB_URI}
+              ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
+              REACT_APP_API_URL=${REACT_APP_API_URL}
+              ENVEOF
+              chmod 600 ~/env.prod
+
+              echo "=== [3/5] Pull images ==="
+              docker pull "${ACR_LOGIN_SERVER}/onlinesupermarket-api:${SHORT_SHA}"
+              docker pull "${ACR_LOGIN_SERVER}/onlinesupermarket-frontend:${SHORT_SHA}"
+
+              echo "=== [4/5] Stop old stack ==="
+              docker compose \
+                -f ~/docker-compose.prod.yml \
+                -p "${COMPOSE_PROJECT}" \
+                --env-file ~/env.prod \
+                down --remove-orphans || true
+
+              echo "=== [5/5] Start new stack ==="
+              docker compose \
+                -f ~/docker-compose.prod.yml \
+                -p "${COMPOSE_PROJECT}" \
+                --env-file ~/env.prod \
+                up -d
+
+              sleep 20
+
+              docker compose -f ~/docker-compose.prod.yml -p "${COMPOSE_PROJECT}" ps
+
+              API=\$(curl -sf -o /dev/null -w "%{http_code}" "http://localhost:${PORT}/health" || echo "000")
+              FRONT=\$(curl -sf -o /dev/null -w "%{http_code}" "http://localhost:80" || echo "000")
+              MONGO=\$(docker inspect supermarket_mongo --format "{{.State.Health.Status}}" 2>/dev/null || echo "unknown")
+
+              echo "API    /health -> HTTP \$API"
+              echo "Frontend  /   -> HTTP \$FRONT"
+              echo "MongoDB       -> \$MONGO"
+
+              docker logout "${ACR_LOGIN_SERVER}"
+
+              if [ "\$API" != "200" ]; then
+                echo "ERROR: API health check failed"
+                docker logs supermarket_api --tail 50
+                exit 1
+              fi
+
+              echo "Deploy successful!"
+              ENDSSH
+            displayName: "Deploy on VM"
+            env:
+              VM_SSH_USER:       $(VM_SSH_USER)
+              VM_SSH_HOST:       $(VM_SSH_HOST)
+              ACR_LOGIN_SERVER:  $(ACR_LOGIN_SERVER)
+              ACR_USERNAME:      $(ACR_USERNAME)
+              ACR_PASSWORD:      $(ACR_PASSWORD)
+              SHORT_SHA:         $(SHORT_SHA)
+              PORT:              $(PORT)
+              MONGODB_URI:       $(MONGODB_URI)
+              ALLOWED_ORIGINS:   $(ALLOWED_ORIGINS)
+              REACT_APP_API_URL: $(REACT_APP_API_URL)
+              COMPOSE_PROJECT:   $(COMPOSE_PROJECT)
+
+          # Always remove SSH key from agent
+          - bash: |
+              rm -f ~/.ssh/deploy_key
+              echo "SSH key removed."
+            displayName: "Cleanup SSH key"
+            condition: always()

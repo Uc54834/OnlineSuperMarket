@@ -1,0 +1,15 @@
+# Root-level node_modules (not used, but safety net)
+node_modules/
+
+# Environment files — never commit secrets
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
