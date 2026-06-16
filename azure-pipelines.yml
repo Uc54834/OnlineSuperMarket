@@ -58,35 +58,28 @@ stages:
   displayName: "CI — Build & Push"
   jobs:
 
-  - job: BuildAndPush
-    displayName: "Build Docker images → ACR"
+  - job: BuildBackend
+    displayName: "Build & Push — Backend"
     pool:
       vmImage: "ubuntu-latest"
-
     steps:
 
-    # ── Checkout (includes submodules: backend + frontend) ────────────────────
     - checkout: self
-      displayName: "Checkout + submodules"
+      displayName: "Checkout"
       submodules: true
       fetchDepth: 0
 
-    # ── Compute 8-char image tag from git SHA ─────────────────────────────────
     - bash: |
         SHORT_SHA=$(echo "$(Build.SourceVersion)" | cut -c1-8)
-        echo "Image tag: $SHORT_SHA"
         echo "##vso[task.setvariable variable=SHORT_SHA;isOutput=true]$SHORT_SHA"
       name: setVars
       displayName: "Compute image tag"
 
-    # ── Login to ACR ──────────────────────────────────────────────────────────
     - bash: |
         echo "$(ACR_PASSWORD)" | docker login "$(ACR_LOGIN_SERVER)" \
-          --username "$(ACR_USERNAME)" \
-          --password-stdin
+          --username "$(ACR_USERNAME)" --password-stdin
       displayName: "ACR Login"
 
-    # ── Build & push backend ──────────────────────────────────────────────────
     - bash: |
         set -euo pipefail
         IMAGE="$(ACR_LOGIN_SERVER)/$(API_IMAGE)"
@@ -96,15 +89,39 @@ stages:
           --file  backend/Dockerfile \
           --tag   "${IMAGE}:${TAG}" \
           --tag   "${IMAGE}:latest" \
-          --cache-from "${IMAGE}:latest" \
           backend/
 
         docker push "${IMAGE}:${TAG}"
         docker push "${IMAGE}:latest"
         echo "Pushed ${IMAGE}:${TAG}"
-      displayName: "Build & Push — Backend"
+      displayName: "Build & Push"
 
-    # ── Build & push frontend (bakes REACT_APP_API_URL into bundle) ───────────
+    - bash: docker logout "$(ACR_LOGIN_SERVER)"
+      displayName: "ACR Logout"
+      condition: always()
+
+  - job: BuildFrontend
+    displayName: "Build & Push — Frontend"
+    pool:
+      vmImage: "ubuntu-latest"
+    steps:
+
+    - checkout: self
+      displayName: "Checkout"
+      submodules: true
+      fetchDepth: 0
+
+    - bash: |
+        SHORT_SHA=$(echo "$(Build.SourceVersion)" | cut -c1-8)
+        echo "##vso[task.setvariable variable=SHORT_SHA;isOutput=true]$SHORT_SHA"
+      name: setVars
+      displayName: "Compute image tag"
+
+    - bash: |
+        echo "$(ACR_PASSWORD)" | docker login "$(ACR_LOGIN_SERVER)" \
+          --username "$(ACR_USERNAME)" --password-stdin
+      displayName: "ACR Login"
+
     - bash: |
         set -euo pipefail
         IMAGE="$(ACR_LOGIN_SERVER)/$(FRONTEND_IMAGE)"
@@ -114,20 +131,27 @@ stages:
           --file  frontend/Dockerfile \
           --tag   "${IMAGE}:${TAG}" \
           --tag   "${IMAGE}:latest" \
-          --cache-from "${IMAGE}:latest" \
           frontend/
 
         docker push "${IMAGE}:${TAG}"
         docker push "${IMAGE}:latest"
         echo "Pushed ${IMAGE}:${TAG}"
-      displayName: "Build & Push — Frontend"
+      displayName: "Build & Push"
 
-    # ── Logout (always) ───────────────────────────────────────────────────────
     - bash: docker logout "$(ACR_LOGIN_SERVER)"
       displayName: "ACR Logout"
       condition: always()
 
-    # ── Publish compose file as artifact for CD stage ─────────────────────────
+  - job: PublishArtifact
+    displayName: "Publish compose artifact"
+    pool:
+      vmImage: "ubuntu-latest"
+    dependsOn: []
+    steps:
+
+    - checkout: self
+      displayName: "Checkout"
+
     - bash: |
         cp docker-compose.yml "$(Build.ArtifactStagingDirectory)/docker-compose.yml"
       displayName: "Stage artifact"
@@ -152,7 +176,7 @@ stages:
     )
 
   variables:
-    SHORT_SHA: $[ stageDependencies.CI.BuildAndPush.outputs['setVars.SHORT_SHA'] ]
+    SHORT_SHA: $[ stageDependencies.CI.BuildBackend.outputs['setVars.SHORT_SHA'] ]
 
   jobs:
 
@@ -241,9 +265,15 @@ stages:
 
               docker logout "$ACR_LOGIN_SERVER"
 
-              # Health checks
-              echo "Waiting 20s for services..."
-              sleep 20
+              # Wait for API to be ready (up to 60s)
+              echo "Waiting for API to be ready..."
+              for i in $(seq 1 12); do
+                API_HTTP=$(curl -sf -o /dev/null -w "%{http_code}" \
+                  "http://localhost:3000/api/health" 2>/dev/null || echo "000")
+                if [ "$API_HTTP" = "200" ]; then break; fi
+                echo "  attempt $i/12 — HTTP $API_HTTP, retrying in 5s..."
+                sleep 5
+              done
 
               docker compose \
                 -f ~/docker-compose.yml \
