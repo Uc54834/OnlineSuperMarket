@@ -1,31 +1,29 @@
-﻿# =============================================================================
+# =============================================================================
 #  OnlineSuperMarket — Azure DevOps CI/CD Pipeline
 #
 #  Stages:
-#    CI  → checkout submodules → build backend + frontend → push to ACR
-#    CD  → SSH to Azure VM → pull images → restart stack → health check
+#    CI  → build backend + frontend images in parallel → push to ACR
+#    CD  → Microsoft-hosted agent SSHs into VM → pull from ACR → restart
 #
 #  ─── SETUP: Pipelines → Library → Variable Group ─────────────────────────────
 #  Group name : onlinesupermarket-secrets
 #
-#  Variable            Example                              Secret?
-#  ─────────────────── ──────────────────────────────────── ───────
-#  ACR_LOGIN_SERVER    myregistry.azurecr.io                no
-#  ACR_USERNAME        myregistry                           no
-#  ACR_PASSWORD        <ACR → Access keys → password>       YES ✓
-#  VM_HOST             20.1.2.3                             no
-#  VM_USER             azureuser                            no
-#  VM_SSH_KEY          -----BEGIN OPENSSH PRIVATE KEY-----  YES ✓
-#  PORT                5000                                  no
-#  MONGODB_URI         mongodb://mongo:27017/SuperMarket     YES ✓
-#  ALLOWED_ORIGINS     http://yourdomain.com                 no
-#  REACT_APP_API_URL   http://yourdomain.com:5000            no
+#  Variable          Example                            Secret?
+#  ───────────────── ────────────────────────────────── ───────
+#  ACR_LOGIN_SERVER  myregistry.azurecr.io              no
+#  ACR_USERNAME      myregistry                         no
+#  ACR_PASSWORD      <ACR → Access keys → password>     YES ✓
+#  VM_HOST           20.1.2.3                           no
+#  VM_USER           azureuser                          no
+#  VM_SSH_KEY_B64    base64 -w 0 key.pem                YES ✓
+#  PORT              5000                               no
+#  MONGODB_URI       mongodb://mongo:27017/SuperMarket  YES ✓
 #
 #  ─── VM PRE-REQUISITES ───────────────────────────────────────────────────────
-#  • Docker Engine installed
-#  • VM_USER in docker group:   sudo usermod -aG docker $VM_USER
-#  • ACR Admin enabled:
-#      Azure Portal → Container Registry → Settings → Access keys → Admin ON
+#  • Docker + docker compose installed
+#  • VM_USER in docker group: sudo usermod -aG docker $VM_USER
+#  • Port 22 open in Azure NSG (inbound rule)
+#  • ACR Admin enabled: Portal → Container Registry → Access keys → Admin ON
 # =============================================================================
 
 trigger:
@@ -52,7 +50,7 @@ variables:
     value: "onlinesupermarket"
 
 # =============================================================================
-#  STAGE 1 — CI : Build & Push images to ACR
+#  STAGE 1 — CI : Build & Push images to ACR (parallel jobs)
 # =============================================================================
 stages:
 
@@ -60,90 +58,83 @@ stages:
   displayName: "CI — Build & Push"
   jobs:
 
-  - job: BuildAndPush
-    displayName: "Build Docker images → ACR"
+  - job: BuildBackend
+    displayName: "Build & Push — Backend"
     pool:
       vmImage: "ubuntu-latest"
-
     steps:
 
-    # ── Checkout (includes submodules: backend + frontend) ────────────────────
     - checkout: self
-      displayName: "Checkout + submodules"
+      displayName: "Checkout"
       submodules: true
       fetchDepth: 0
 
-    # ── Compute 8-char image tag from git SHA ─────────────────────────────────
     - bash: |
         SHORT_SHA=$(echo "$(Build.SourceVersion)" | cut -c1-8)
-        echo "Image tag: $SHORT_SHA"
         echo "##vso[task.setvariable variable=SHORT_SHA;isOutput=true]$SHORT_SHA"
       name: setVars
       displayName: "Compute image tag"
 
-    # ── Login to ACR ──────────────────────────────────────────────────────────
     - bash: |
         echo "$(ACR_PASSWORD)" | docker login "$(ACR_LOGIN_SERVER)" \
-          --username "$(ACR_USERNAME)" \
-          --password-stdin
+          --username "$(ACR_USERNAME)" --password-stdin
       displayName: "ACR Login"
 
-    # ── Build & push backend ──────────────────────────────────────────────────
     - bash: |
         set -euo pipefail
         IMAGE="$(ACR_LOGIN_SERVER)/$(API_IMAGE)"
         TAG="$(setVars.SHORT_SHA)"
-
-        docker build \
-          --file  backend/Dockerfile \
-          --tag   "${IMAGE}:${TAG}" \
-          --tag   "${IMAGE}:latest" \
-          --cache-from "${IMAGE}:latest" \
-          backend/
-
+        docker build --file backend/Dockerfile \
+          --tag "${IMAGE}:${TAG}" --tag "${IMAGE}:latest" backend/
         docker push "${IMAGE}:${TAG}"
         docker push "${IMAGE}:latest"
         echo "Pushed ${IMAGE}:${TAG}"
-      displayName: "Build & Push — Backend"
+      displayName: "Build & Push"
 
-    # ── Build & push frontend (bakes REACT_APP_API_URL into bundle) ───────────
-    - bash: |
-        set -euo pipefail
-        IMAGE="$(ACR_LOGIN_SERVER)/$(FRONTEND_IMAGE)"
-        TAG="$(setVars.SHORT_SHA)"
-
-        docker build \
-          --file  frontend/Dockerfile \
-          --build-arg REACT_APP_API_URL="$(REACT_APP_API_URL)" \
-          --tag   "${IMAGE}:${TAG}" \
-          --tag   "${IMAGE}:latest" \
-          --cache-from "${IMAGE}:latest" \
-          frontend/
-
-        docker push "${IMAGE}:${TAG}"
-        docker push "${IMAGE}:latest"
-        echo "Pushed ${IMAGE}:${TAG}"
-      displayName: "Build & Push — Frontend"
-
-    # ── Logout (always) ───────────────────────────────────────────────────────
     - bash: docker logout "$(ACR_LOGIN_SERVER)"
       displayName: "ACR Logout"
       condition: always()
 
-    # ── Publish compose file as artifact for CD stage ─────────────────────────
-    - bash: |
-        cp docker-compose.yml "$(Build.ArtifactStagingDirectory)/docker-compose.yml"
-      displayName: "Stage artifact"
+  - job: BuildFrontend
+    displayName: "Build & Push — Frontend"
+    pool:
+      vmImage: "ubuntu-latest"
+    steps:
 
-    - task: PublishBuildArtifacts@1
-      displayName: "Publish compose artifact"
-      inputs:
-        PathtoPublish: "$(Build.ArtifactStagingDirectory)"
-        ArtifactName: "deploy"
+    - checkout: self
+      displayName: "Checkout"
+      submodules: true
+      fetchDepth: 0
+
+    - bash: |
+        SHORT_SHA=$(echo "$(Build.SourceVersion)" | cut -c1-8)
+        echo "##vso[task.setvariable variable=SHORT_SHA;isOutput=true]$SHORT_SHA"
+      name: setVars
+      displayName: "Compute image tag"
+
+    - bash: |
+        echo "$(ACR_PASSWORD)" | docker login "$(ACR_LOGIN_SERVER)" \
+          --username "$(ACR_USERNAME)" --password-stdin
+      displayName: "ACR Login"
+
+    - bash: |
+        set -euo pipefail
+        IMAGE="$(ACR_LOGIN_SERVER)/$(FRONTEND_IMAGE)"
+        TAG="$(setVars.SHORT_SHA)"
+        docker build --file frontend/Dockerfile \
+          --tag "${IMAGE}:${TAG}" --tag "${IMAGE}:latest" frontend/
+        docker push "${IMAGE}:${TAG}"
+        docker push "${IMAGE}:latest"
+        echo "Pushed ${IMAGE}:${TAG}"
+      displayName: "Build & Push"
+
+    - bash: docker logout "$(ACR_LOGIN_SERVER)"
+      displayName: "ACR Logout"
+      condition: always()
 
 # =============================================================================
-#  STAGE 2 — CD : Deploy to Azure VM via SSH
-#  Only runs on main branch after CI passes
+#  STAGE 2 — CD : SSH into VM and deploy
+#  Requires port 22 open in Azure NSG for Microsoft-hosted agent IPs
 # =============================================================================
 - stage: CD
   displayName: "CD — Deploy to VM"
@@ -155,180 +146,133 @@ stages:
     )
 
   variables:
-    SHORT_SHA: $[ stageDependencies.CI.BuildAndPush.outputs['setVars.SHORT_SHA'] ]
+    SHORT_SHA: $[ stageDependencies.CI.BuildBackend.outputs['setVars.SHORT_SHA'] ]
 
   jobs:
 
-  - deployment: VMDeploy
+  - job: Deploy
     displayName: "SSH deploy"
     pool:
       vmImage: "ubuntu-latest"
-    environment: "production"
 
-    strategy:
-      runOnce:
-        deploy:
-          steps:
+    steps:
 
-          # ── Download compose artifact ─────────────────────────────────────────
-          - download: current
-            artifact: deploy
-            displayName: "Download compose artifact"
+    # ── Install SSH key ─────────────────────────────────────────────────────
+    - bash: |
+        mkdir -p ~/.ssh && chmod 700 ~/.ssh
+        echo "$(VM_SSH_KEY_B64)" | base64 -d > ~/.ssh/deploy_key
+        chmod 600 ~/.ssh/deploy_key
+        ssh-keyscan -H "$(VM_HOST)" >> ~/.ssh/known_hosts 2>/dev/null
+        echo "SSH key ready."
+      displayName: "Install SSH key"
+      env:
+        VM_SSH_KEY_B64: $(VM_SSH_KEY_B64)
 
-          # ── Write SSH key + trust VM host ─────────────────────────────────────
-          - bash: |
-              mkdir -p ~/.ssh
-              chmod 700 ~/.ssh
-              printf '%s\n' "$(VM_SSH_KEY)" > ~/.ssh/deploy_key
-              chmod 600 ~/.ssh/deploy_key
-              ssh-keyscan -H "$(VM_HOST)" >> ~/.ssh/known_hosts 2>/dev/null
-              echo "SSH key ready."
-            displayName: "Install SSH key"
+    # ── Copy docker-compose.yml to VM ───────────────────────────────────────
+    - bash: |
+        scp -i ~/.ssh/deploy_key \
+          -o StrictHostKeyChecking=no \
+          -o BatchMode=yes \
+          docker-compose.yml \
+          "$(VM_USER)@$(VM_HOST):~/docker-compose.yml"
+        echo "Copied docker-compose.yml to VM."
+      displayName: "Copy compose file"
+      env:
+        VM_USER: $(VM_USER)
+        VM_HOST: $(VM_HOST)
 
-          # ── Write the deploy script locally, then copy + run on VM ───────────
-          # This avoids all heredoc quoting/escaping issues.
-          - bash: |
-              cat > /tmp/deploy.sh << 'SCRIPT'
-              #!/usr/bin/env bash
-              set -euo pipefail
+    # ── Deploy on VM ────────────────────────────────────────────────────────
+    - bash: |
+        ssh -i ~/.ssh/deploy_key \
+          -o StrictHostKeyChecking=no \
+          -o BatchMode=yes \
+          "$(VM_USER)@$(VM_HOST)" \
+          "ACR_LOGIN_SERVER='$(ACR_LOGIN_SERVER)' \
+           ACR_USERNAME='$(ACR_USERNAME)' \
+           ACR_PASSWORD='$(ACR_PASSWORD)' \
+           API_IMAGE='$(API_IMAGE)' \
+           FRONTEND_IMAGE='$(FRONTEND_IMAGE)' \
+           IMAGE_TAG='$(SHORT_SHA)' \
+           COMPOSE_PROJECT='$(COMPOSE_PROJECT)' \
+           PORT='$(PORT)' \
+           MONGODB_URI='$(MONGODB_URI)' \
+           bash -s" << 'ENDSSH'
+        set -euo pipefail
 
-              echo "============================================"
-              echo " OnlineSuperMarket deploy  |  tag: $IMAGE_TAG"
-              echo "============================================"
+        echo "=== [1/5] ACR login ==="
+        echo "$ACR_PASSWORD" | docker login "$ACR_LOGIN_SERVER" \
+          --username "$ACR_USERNAME" --password-stdin
 
-              # 1. Login to ACR
-              echo "[1/5] ACR login..."
-              echo "$ACR_PASSWORD" | docker login "$ACR_LOGIN_SERVER" \
-                --username "$ACR_USERNAME" --password-stdin
+        echo "=== [2/5] Writing .env ==="
+        printf 'PORT=%s\nMONGODB_URI=%s\n' "$PORT" "$MONGODB_URI" > ~/supermarket.env
+        chmod 600 ~/supermarket.env
 
-              # 2. Write .env (600 perms — secrets never in logs)
-              echo "[2/5] Writing .env..."
-              cat > ~/supermarket.env << ENV
-              PORT=$PORT
-              MONGODB_URI=$MONGODB_URI
-              ALLOWED_ORIGINS=$ALLOWED_ORIGINS
-              REACT_APP_API_URL=$REACT_APP_API_URL
-              ENV
-              chmod 600 ~/supermarket.env
+        echo "=== [3/5] Pulling images ==="
+        docker pull "$ACR_LOGIN_SERVER/$API_IMAGE:$IMAGE_TAG"
+        docker pull "$ACR_LOGIN_SERVER/$FRONTEND_IMAGE:$IMAGE_TAG"
 
-              # 3. Pull new images from ACR
-              echo "[3/5] Pulling images..."
-              docker pull "$ACR_LOGIN_SERVER/$API_IMAGE:$IMAGE_TAG"
-              docker pull "$ACR_LOGIN_SERVER/$FRONTEND_IMAGE:$IMAGE_TAG"
+        echo "=== [4/5] Writing compose override ==="
+        cat > ~/docker-compose.override.yml << EOF
+        services:
+          api:
+            image: $ACR_LOGIN_SERVER/$API_IMAGE:$IMAGE_TAG
+            build: !reset null
+          frontend:
+            image: $ACR_LOGIN_SERVER/$FRONTEND_IMAGE:$IMAGE_TAG
+            build: !reset null
+        EOF
 
-              # 4. Write compose override — swap build: for image: (no local build on VM)
-              echo "[4/5] Writing compose override..."
-              cat > ~/docker-compose.override.yml << OVERRIDE
-              services:
-                api:
-                  image: $ACR_LOGIN_SERVER/$API_IMAGE:$IMAGE_TAG
-                  build: !reset null
-                frontend:
-                  image: $ACR_LOGIN_SERVER/$FRONTEND_IMAGE:$IMAGE_TAG
-                  build: !reset null
-              OVERRIDE
+        echo "=== [5/5] Restarting stack ==="
+        docker compose \
+          -f ~/docker-compose.yml \
+          -f ~/docker-compose.override.yml \
+          -p "$COMPOSE_PROJECT" \
+          --env-file ~/supermarket.env \
+          down --remove-orphans || true
 
-              # 5. Stop old stack → start new stack
-              echo "[5/5] Restarting stack..."
-              docker compose \
-                -f ~/docker-compose.yml \
-                -f ~/docker-compose.override.yml \
-                -p "$COMPOSE_PROJECT" \
-                --env-file ~/supermarket.env \
-                down --remove-orphans || true
+        docker compose \
+          -f ~/docker-compose.yml \
+          -f ~/docker-compose.override.yml \
+          -p "$COMPOSE_PROJECT" \
+          --env-file ~/supermarket.env \
+          up -d --no-build
 
-              docker compose \
-                -f ~/docker-compose.yml \
-                -f ~/docker-compose.override.yml \
-                -p "$COMPOSE_PROJECT" \
-                --env-file ~/supermarket.env \
-                up -d --no-build
+        docker logout "$ACR_LOGIN_SERVER"
 
-              docker logout "$ACR_LOGIN_SERVER"
+        echo "Waiting for services..."
+        for i in $(seq 1 12); do
+          HTTP=$(curl -sf -o /dev/null -w "%{http_code}" \
+            http://localhost:3000/api/health 2>/dev/null || echo "000")
+          [ "$HTTP" = "200" ] && { echo "Ready after attempt $i"; break; }
+          echo "  attempt $i/12 — HTTP $HTTP, retrying in 5s..."
+          sleep 5
+        done
 
-              # Health checks
-              echo "Waiting 20s for services..."
-              sleep 20
+        HTTP=$(curl -sf -o /dev/null -w "%{http_code}" \
+          http://localhost:3000/api/health 2>/dev/null || echo "000")
+        if [ "$HTTP" != "200" ]; then
+          echo "ERROR: health check failed"
+          docker logs supermarket_api --tail 80 2>&1 || true
+          exit 1
+        fi
 
-              docker compose \
-                -f ~/docker-compose.yml \
-                -p "$COMPOSE_PROJECT" \
-                ps
+        echo "Deploy complete! tag=$IMAGE_TAG"
+        ENDSSH
+      displayName: "Deploy on VM"
+      env:
+        ACR_LOGIN_SERVER: $(ACR_LOGIN_SERVER)
+        ACR_USERNAME:     $(ACR_USERNAME)
+        ACR_PASSWORD:     $(ACR_PASSWORD)
+        VM_USER:          $(VM_USER)
+        VM_HOST:          $(VM_HOST)
+        API_IMAGE:        $(API_IMAGE)
+        FRONTEND_IMAGE:   $(FRONTEND_IMAGE)
+        SHORT_SHA:        $(SHORT_SHA)
+        COMPOSE_PROJECT:  $(COMPOSE_PROJECT)
+        PORT:             $(PORT)
+        MONGODB_URI:      $(MONGODB_URI)
 
-              API_HTTP=$(curl -sf -o /dev/null -w "%{http_code}" \
-                "http://localhost:$PORT/health" 2>/dev/null || echo "000")
-              WEB_HTTP=$(curl -sf -o /dev/null -w "%{http_code}" \
-                "http://localhost:80" 2>/dev/null || echo "000")
-
-              echo ""
-              echo "  API  /health  →  HTTP $API_HTTP"
-              echo "  Web  /        →  HTTP $WEB_HTTP"
-              echo ""
-
-              if [ "$API_HTTP" != "200" ]; then
-                echo "ERROR: API health check failed — last 80 log lines:"
-                docker logs "${COMPOSE_PROJECT}-api-1" --tail 80 2>&1 || true
-                exit 1
-              fi
-
-              echo "Deploy complete!  tag=$IMAGE_TAG"
-              SCRIPT
-              chmod +x /tmp/deploy.sh
-              echo "Deploy script written."
-            displayName: "Write deploy script"
-
-          # ── Copy compose file + deploy script to VM ───────────────────────────
-          - bash: |
-              scp -i ~/.ssh/deploy_key \
-                  -o StrictHostKeyChecking=no \
-                  -o BatchMode=yes \
-                  "$(Pipeline.Workspace)/deploy/docker-compose.yml" \
-                  /tmp/deploy.sh \
-                  "$(VM_USER)@$(VM_HOST):~/"
-              echo "Files copied to VM."
-            displayName: "Copy files to VM"
-
-          # ── Execute deploy script on VM ───────────────────────────────────────
-          # All Azure DevOps variables are expanded here on the agent BEFORE SSH.
-          # The script receives them as plain env vars — no quoting ambiguity.
-          - bash: |
-              ssh -i ~/.ssh/deploy_key \
-                  -o StrictHostKeyChecking=no \
-                  -o BatchMode=yes \
-                  "$(VM_USER)@$(VM_HOST)" \
-                  "chmod +x ~/deploy.sh && \
-                   ACR_LOGIN_SERVER='$(ACR_LOGIN_SERVER)' \
-                   ACR_USERNAME='$(ACR_USERNAME)' \
-                   ACR_PASSWORD='$(ACR_PASSWORD)' \
-                   API_IMAGE='$(API_IMAGE)' \
-                   FRONTEND_IMAGE='$(FRONTEND_IMAGE)' \
-                   IMAGE_TAG='$(SHORT_SHA)' \
-                   COMPOSE_PROJECT='$(COMPOSE_PROJECT)' \
-                   PORT='$(PORT)' \
-                   MONGODB_URI='$(MONGODB_URI)' \
-                   ALLOWED_ORIGINS='$(ALLOWED_ORIGINS)' \
-                   REACT_APP_API_URL='$(REACT_APP_API_URL)' \
-                   ~/deploy.sh"
-            displayName: "Run deploy on VM"
-            env:
-              # Explicit env mapping so Azure masks secret values in logs
-              ACR_LOGIN_SERVER:  $(ACR_LOGIN_SERVER)
-              ACR_USERNAME:      $(ACR_USERNAME)
-              ACR_PASSWORD:      $(ACR_PASSWORD)
-              VM_USER:           $(VM_USER)
-              VM_HOST:           $(VM_HOST)
-              SHORT_SHA:         $(SHORT_SHA)
-              API_IMAGE:         $(API_IMAGE)
-              FRONTEND_IMAGE:    $(FRONTEND_IMAGE)
-              COMPOSE_PROJECT:   $(COMPOSE_PROJECT)
-              PORT:              $(PORT)
-              MONGODB_URI:       $(MONGODB_URI)
-              ALLOWED_ORIGINS:   $(ALLOWED_ORIGINS)
-              REACT_APP_API_URL: $(REACT_APP_API_URL)
-
-          # ── Cleanup SSH key from agent (always runs) ──────────────────────────
-          - bash: |
-              rm -f ~/.ssh/deploy_key /tmp/deploy.sh
-              echo "Cleaned up."
-            displayName: "Cleanup"
-            condition: always()
+    # ── Cleanup ────────────────────────────────────────────────────────────
+    - bash: rm -f ~/.ssh/deploy_key
+      displayName: "Cleanup"
+      condition: always()

@@ -1,6 +1,5 @@
 ﻿import "dotenv/config";
 import express from "express";
-import cors from "cors";
 import helmet from "helmet";
 import { connectDB } from "./mongo.js";
 import Cart from "./models/Cart.js";
@@ -10,29 +9,6 @@ const app = express();
 
 // ── Security headers ──────────────────────────────────────────────────────────
 app.use(helmet());
-
-// ── CORS ──────────────────────────────────────────────────────────────────────
-// ALLOWED_ORIGINS = comma-separated list, e.g.
-//   http://localhost:3000,http://localhost,https://yourdomain.com
-const rawOrigins = process.env.ALLOWED_ORIGINS || "http://localhost:3000";
-const allowedOrigins = rawOrigins.split(",").map((o) => o.trim());
-
-const corsOptions = {
-    origin: (origin, callback) => {
-        // Allow requests with no origin (Postman, curl, mobile apps)
-        if (!origin) return callback(null, true);
-        if (allowedOrigins.includes(origin)) return callback(null, true);
-        return callback(new Error(`CORS: origin "${origin}" not allowed`));
-    },
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: true,
-    optionsSuccessStatus: 200,   // some legacy browsers choke on 204
-};
-
-app.use(cors(corsOptions));
-// Handle all OPTIONS pre-flight requests
-app.options("/{*path}", cors(corsOptions));
 
 // ── Body parser ───────────────────────────────────────────────────────────────
 app.use(express.json());
@@ -125,5 +101,4 @@ app.post("/login", async (req, res) => {
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, "0.0.0.0", () => {
     console.log(`✅  Server running on http://0.0.0.0:${PORT}`);
-    console.log(`   Allowed origins: ${allowedOrigins.join(", ")}`);
 });
